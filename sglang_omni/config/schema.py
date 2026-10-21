@@ -12,6 +12,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic.main import IncEx
 from typing_extensions import Unpack
 
+from sglang_omni.proto.session import (
+    DEFAULT_MAX_OUTPUT_LEAD_MS,
+    ControlEdge,
+    DataEdge,
+    SessionGraph,
+    SessionNode,
+)
+
 if TYPE_CHECKING:
     from sglang_omni.serve.realtime.transcription_session import StreamingASRStrategy
 else:
@@ -246,6 +254,16 @@ class FactoryArgs(BaseModel):
             pass
 
 
+class ServiceConfig(BaseModel):
+    """A service the pipeline talks to, started before it when its port does not answer."""
+
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1)
+    command: list[str] = Field(min_length=1)
+    port: int = Field(gt=0, lt=65536)
+    env: dict[str, str] = Field(default_factory=dict)
+
+
 class PlacementConfig(BaseModel):
     """Pipeline-level placement planning limits."""
 
@@ -380,6 +398,10 @@ class StageConfig(BaseModel):
     gpu: int | list[int] | None = None
     tp_size: int = Field(default=1, ge=1)
     process: str | None = None
+    allow_child_processes: bool = False
+    """Allow a native engine to own subprocesses inside this stage process."""
+    runtime_gpu_ids: list[int] | None = None
+    """GPUs reserved for an engine that launches its own workers."""
     gpu_memory_fraction: float | None = Field(
         default=None,
         gt=0,
@@ -415,6 +437,33 @@ class StageConfig(BaseModel):
     )
 
     def model_post_init(self, __context: object = None) -> None:
+        if self.http_routes:
+            self.http_routes = list(
+                normalize_route_prefixes(self.name, self.http_routes)
+            )
+        else:
+            pass
+        if self.runtime_gpu_ids is not None:
+            if not self.allow_child_processes or self.tp_size != 1:
+                raise ValueError(
+                    "runtime_gpu_ids requires one stage process that owns children"
+                )
+            else:
+                pass
+            if (
+                not isinstance(self.gpu, int)
+                or not self.runtime_gpu_ids
+                or self.runtime_gpu_ids[0] != self.gpu
+                or any(gpu < 0 for gpu in self.runtime_gpu_ids)
+                or len(set(self.runtime_gpu_ids)) != len(self.runtime_gpu_ids)
+            ):
+                raise ValueError(
+                    "runtime_gpu_ids must be unique GPUs starting with the stage GPU"
+                )
+            else:
+                pass
+        else:
+            pass
         if self.http_routes:
             self.http_routes = list(
                 normalize_route_prefixes(self.name, self.http_routes)
@@ -622,6 +671,50 @@ class ModelDumpOptions(TypedDict, total=False):
     polymorphic_serialization: bool | None
 
 
+class SessionControlEdgeConfig(BaseModel):
+    """An input of a node written `{"kind": "control", "source", "event"}`: the control event of `source` reaches the node as a control operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["control"]
+    source: str
+    event: str
+    preempt: bool = False
+
+    def edge(self) -> ControlEdge:
+        """The runtime edge; the declaration's `preempt` is the edge's `should_preempt`."""
+        return ControlEdge(
+            source=self.source,
+            event=self.event,
+            should_preempt=self.preempt,
+        )
+
+
+class SessionDataEdgeConfig(BaseModel):
+    """An input of a stage node written `{"source", "capacity", "overflow", "feedback"}`: the `source` of a plain input with the bound of its edge (see `DataEdge`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    capacity: int | None = Field(default=None, gt=0)
+    overflow: Literal["block", "drop_oldest"] = "block"
+    feedback: bool = False
+
+    def edge(self) -> DataEdge:
+        return DataEdge(self.source, self.capacity, self.overflow, self.feedback)
+
+
+class SessionNodeConfig(BaseModel):
+    """One stage route of the Session graph and the sources it reads."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stages: list[str] = Field(min_length=1)
+    inputs: list[str | SessionDataEdgeConfig | SessionControlEdgeConfig] = Field(
+        min_length=1
+    )
+
+
 class PipelineConfig(BaseModel):
     """Top-level pipeline configuration.
 
@@ -633,6 +726,8 @@ class PipelineConfig(BaseModel):
     architecture: ClassVar[str | None] = None
     architecture_aliases: ClassVar[tuple[str, ...]] = ()
     requires_model_capabilities: ClassVar[bool] = False
+    freeze_api_gc_on_startup: ClassVar[bool] = False
+    supports_image_api: ClassVar[bool] = False
     tensor_parallel_disable_custom_all_reduce_stages: ClassVar[tuple[str, ...]] = ()
     required_speech_reference_count: ClassVar[int | None] = None
     speech_reference_text_required: ClassVar[bool] = False
@@ -640,6 +735,9 @@ class PipelineConfig(BaseModel):
     additional_speech_languages: ClassVar[frozenset[str]] = frozenset()
     realtime_transcription: ClassVar[RealtimeTranscriptionConfig | None] = None
     realtime_deployment_factory: ClassVar[str | None] = None
+    # True when results are ordered interleaved (UMM) segments, which
+    # /generate can stream.
+    interleaved_output: ClassVar[bool] = False
     is_realtime_only: ClassVar[bool] = False
     # Import path of the function that builds, from this config, the chat,
     # speech or transcription request the server sends itself before it reports
@@ -669,6 +767,14 @@ class PipelineConfig(BaseModel):
     endpoints: EndpointsConfig = Field(default_factory=EndpointsConfig)
     terminal_stages_fn: str | None = None
     config_cls: str | None = None
+    session_nodes: dict[str, SessionNodeConfig] = Field(default_factory=dict)
+    "The Session as a graph of stage routes; empty when the Session is the one route from the entry stage."
+    session_publish: dict[str, list[str]] = Field(default_factory=dict)
+    "Per node of the graph, the chunk formats that reach the client."
+    max_output_lead_ms: float = Field(default=DEFAULT_MAX_OUTPUT_LEAD_MS, gt=0)
+    "How far ahead of real time, counted from a reply's start, a Session delivers the reply's audio; an interruption cannot take back audio already delivered."
+    services: list[ServiceConfig] = Field(default_factory=list)
+    "The services started in this order before the pipeline, each waited for until its /v1/models answers."
 
     def model_dump(self, **kwargs: Unpack[ModelDumpOptions]) -> dict[str, object]:
         """Dump with each stage serialized by its runtime class.
@@ -795,6 +901,52 @@ class PipelineConfig(BaseModel):
     def terminal_stages(self) -> list[str]:
         return [s.name for s in self.stages if s.terminal]
 
+    def session_route(self) -> list[str]:
+        """The stage chain a Session of this pipeline follows: `next` from the entry stage to a terminal stage."""
+        route = [self.resolved_entry_stage]
+        while True:
+            following = self.stage_named(route[-1]).next
+            if following is None:
+                return route
+            elif isinstance(following, list) and len(following) == 1:
+                route.append(following[0])
+            elif isinstance(following, str):
+                route.append(following)
+            else:
+                raise ValueError(
+                    f"the stage chain forks at {route[-1]!r} into {following}; "
+                    "a Session of this pipeline needs session_nodes"
+                )
+
+    def session_graph(self) -> SessionGraph | None:
+        """The node graph a Session of this pipeline is, when it is more than one route."""
+        if not self.session_nodes:
+            return None
+        else:
+            pass
+        nodes = {
+            name: SessionNode(
+                stages=tuple(node.stages),
+                inputs=tuple(
+                    entry if isinstance(entry, str) else entry.edge()
+                    for entry in node.inputs
+                    if not isinstance(entry, SessionControlEdgeConfig)
+                ),
+                controls=tuple(
+                    entry.edge()
+                    for entry in node.inputs
+                    if isinstance(entry, SessionControlEdgeConfig)
+                ),
+            )
+            for name, node in self.session_nodes.items()
+        }
+        return SessionGraph(
+            nodes=nodes,
+            publish={
+                name: tuple(formats) for name, formats in self.session_publish.items()
+            },
+        )
+
     @classmethod
     def process_local_edges(cls) -> frozenset[tuple[str, str]]:
         """Pipeline edges whose stages must stay in the same process.
@@ -810,6 +962,12 @@ class PipelineConfig(BaseModel):
         compatibility guard at the declaration.
         """
         return frozenset()
+
+    def image_decode_mode(self) -> Literal["normal", "decoder-turbo"]:
+        return "normal"
+
+    def image_decode_steps(self) -> int:
+        return 50
 
     def stage_named(self, stage_name: str) -> StageConfig:
         """The stage with this name; raises ``KeyError`` when absent."""
@@ -851,13 +1009,34 @@ class PipelineConfig(BaseModel):
 
         Stage settings override pipeline defaults; model policies may derive
         missing values here without persisting them in the configuration.
+        A stage whose native engine owns worker processes gets the per worker
+        thread default of native multimodal_gen, since its children inherit
+        the stage process environment instead of an equal share of the plan.
         """
-        return {**self.resolved_env_defaults(), **self.stage_named(stage_name).env}
+        stage = self.stage_named(stage_name)
+        env_defaults = {**self.resolved_env_defaults(), **stage.env}
+        if stage.allow_child_processes and "OMP_NUM_THREADS" not in env_defaults:
+            from sglang_omni.utils.cpu import native_worker_intraop_threads
+
+            workers = len(stage.runtime_gpu_ids) if stage.runtime_gpu_ids else 1
+            env_defaults["OMP_NUM_THREADS"] = str(
+                native_worker_intraop_threads(workers)
+            )
+        else:
+            pass
+        return env_defaults
 
     @classmethod
     def generation_admission_defaults(cls) -> dict[str, int]:
         """Coordinator in-flight cap defaults (running + queued). Overlay with CLI."""
         return {}
+
+    def entry_stage_admission_limit(self) -> int | None:
+        """Requests one entry stage replica admits at once, when it owns admission.
+
+        None derives the coordinator in-flight cap from the generation engine.
+        """
+        return None
 
     @classmethod
     def code2wav_stage(cls) -> str | None:
@@ -911,6 +1090,12 @@ class PipelineConfig(BaseModel):
     def validate_general(self) -> None:
         if not self.model_path:
             raise ValueError("Model path is required")
+        else:
+            pass
+        names = [service.name for service in self.services]
+        ports = [service.port for service in self.services]
+        if len(set(names)) != len(names) or len(set(ports)) != len(ports):
+            raise ValueError("services must have distinct names and ports")
         else:
             pass
         for stage in self.stages:

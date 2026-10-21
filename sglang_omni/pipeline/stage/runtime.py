@@ -59,11 +59,13 @@ from sglang_omni.proto import (
     StreamMessage,
     SubmitMessage,
 )
-from sglang_omni.proto.session import find_session_operation
+from sglang_omni.proto.request import RoutedPayloads
+from sglang_omni.proto.session import SessionOperation, find_session_operation
 from sglang_omni.relay.base import Relay
 from sglang_omni.scheduling.message import (
     IncomingMessage,
     OutgoingMessage,
+    ResultOwningScheduler,
     StageScheduler,
 )
 from sglang_omni.serve.stage_routes import StageHttpServer, StageRoutesError
@@ -132,16 +134,24 @@ class Stage:
         tp_fanout: TPLeaderFanout | None = None,
         is_terminal: bool = False,
         replica_topology: dict[str, list[str]] | None = None,
+        allow_child_processes: bool = False,
         http_socket_path: str | None = None,
     ) -> None:
         self.name = name
         self.role = role
         self.get_next = get_next
         self.gpu_id = gpu_id
+        # The host of a native engine that owns subprocesses never computes on
+        # the device itself, so its threads do not pin a CUDA device either.
+        self.allow_child_processes = allow_child_processes
         self.endpoints = endpoints
         self.control_plane = control_plane
         self.input_handler = input_handler or DirectInput()
         self.scheduler = scheduler
+        # Resolved once, so stages whose scheduler owns nothing route as before.
+        self.result_owner = (
+            scheduler if isinstance(scheduler, ResultOwningScheduler) else None
+        )
         self.project_payload = project_payload or {}
         self.stream_targets = stream_targets or []
         self.get_stream_done_targets = get_stream_done_targets
@@ -253,14 +263,16 @@ class Stage:
         # Start scheduler in dedicated thread
         if self.scheduler is not None:
             serving_thread_ready = threading.Event()
+            warmup_error: Exception | None = None
 
             def _run_scheduler() -> None:
+                nonlocal warmup_error
                 try:
                     try:
                         # Active-stage binding so ``emit(stage=None)`` from
                         # scheduler-thread descendants resolves to this stage.
                         _set_active_stage(self.name)
-                        if self.gpu_id is not None:
+                        if self.gpu_id is not None and not self.allow_child_processes:
                             from sglang_omni.platforms import current_platform
 
                             current_platform.set_device(
@@ -275,6 +287,9 @@ class Stage:
                         else:
                             pass
                         self.scheduler.warm_up_serving_thread()
+                    except Exception as exc:
+                        warmup_error = exc
+                        raise
                     finally:
                         serving_thread_ready.set()
                     self.scheduler.start()
@@ -297,6 +312,10 @@ class Stage:
             )
             self.scheduler_thread.start()
             await asyncio.to_thread(serving_thread_ready.wait)
+            if warmup_error is not None:
+                raise warmup_error
+            else:
+                pass
         else:
             pass
         if self.http_socket_path is not None:
@@ -1151,6 +1170,21 @@ class Stage:
             return
         else:
             pass
+        session_operation = find_session_operation(payload.request.metadata)
+        if session_operation is not None:
+            # Note (Junnan Li): A preempted append dies here as the control arrives: its result here and anything it sends here later are dropped.
+            for preempted_request_id in session_operation.preempted_request_ids:
+                self.on_abort(preempted_request_id)
+        else:
+            pass
+        if (
+            session_operation is not None
+            and session_operation.operation == "append"
+            and self.owns_external_io
+        ):
+            await self.forward_session_append(request_id, payload, session_operation)
+        else:
+            pass
         _emit_event(
             request_id=request_id,
             stage=self.name,
@@ -1170,6 +1204,30 @@ class Stage:
             enqueue(msg)
         else:
             self.scheduler.inbox.put(msg)
+
+    async def forward_session_append(
+        self,
+        request_id: str,
+        payload: StagePayload,
+        session_operation: SessionOperation,
+    ) -> None:
+        """A session unit's payload reaches an owner this stage streams to before the stream; the stream is this stage's whole output to it."""
+        owners = session_operation.stages
+        if self.name not in owners:
+            return
+        else:
+            index = owners.index(self.name)
+        if index + 1 < len(owners) and owners[index + 1] in self.stream_targets:
+            # Note (Junnan Li): Nothing of this request has streamed yet, so the payload cannot overtake a chunk and may go the local way.
+            await self.send_to_stage(
+                request_id,
+                owners[index + 1],
+                payload,
+                allow_local_object=True,
+                stream_targets_for_request=set(),
+            )
+        else:
+            pass
 
     async def on_admin(self, msg: AdminMessage) -> None:
         operation = msg.operation
@@ -1420,6 +1478,8 @@ class Stage:
                             return
                         else:
                             pass
+                    elif out.type == "result" and self.result_owner is not None:
+                        self.result_owner.release_result(out.data, delivered=False)
                     elif out.type == "wakeup":
                         # Checked after the routed types, so routing pays
                         # nothing, and after the stream run above was routed.
@@ -1486,6 +1546,10 @@ class Stage:
             if out.type == "wakeup":
                 return
             elif out.type == "result":
+                if self.result_owner is not None:
+                    self.result_owner.release_result(out.data, delivered=False)
+                else:
+                    pass
                 self.clear_request_state(out.request_id)
             elif out.type == "stream":
                 continue
@@ -1587,12 +1651,47 @@ class Stage:
         else:
             pass
 
+    async def route_owned_result(self, request_id: str, result: object) -> None:
+        """Route a scheduler owned result and release it once routing settles.
+
+        The release runs after routing fails or is cancelled too, and tells the
+        scheduler whether a transport accepted the result.
+        """
+        owner = self.result_owner
+        delivered = False
+
+        def on_submitted() -> None:
+            nonlocal delivered
+            delivered = True
+
+        try:
+            await self.route_result(request_id, result, on_submitted)
+        except BaseException:
+            try:
+                owner.release_result(result, delivered=delivered)
+            except Exception:
+                logger.exception(
+                    "Stage %s failed to release result for %s", self.name, request_id
+                )
+            raise
+        owner.release_result(result, delivered=delivered)
+
     async def route_result(
         self,
         request_id: str,
         result: object,
+        on_submitted: Callable[[], None] | None = None,
     ) -> None:
-        """Route a completed result to next stage(s) or complete at coordinator."""
+        """Route a completed result to next stage(s) or complete at coordinator.
+
+        ``on_submitted`` reports transport acceptance to a result owning
+        scheduler, which route_owned_result supplies.
+        """
+        if on_submitted is None and self.result_owner is not None:
+            await self.route_owned_result(request_id, result)
+            return
+        else:
+            pass
         if not self.owns_external_io:
             self.clear_request_state(request_id)
             return
@@ -1604,33 +1703,47 @@ class Stage:
             else None
         )
         if session_operation is not None and session_operation.operation != "append":
-            await self.control_plane.send_complete(
-                CompleteMessage(
-                    request_id=request_id,
-                    from_stage=self.name,
-                    success=True,
-                    result=result.data,
-                )
+            message = CompleteMessage(
+                request_id=request_id,
+                from_stage=self.name,
+                success=True,
+                result=result.data,
             )
+            if on_submitted is None:
+                await self.control_plane.send_complete(message)
+            else:
+                await self.control_plane.send_complete(
+                    message, on_submitted=on_submitted
+                )
+                on_submitted()
             self.clear_request_state(request_id)
             return
         else:
             pass
-        if session_operation is not None:
+        actual = self.get_next(request_id, result)
+        is_forwarded_at_admission = False
+        if session_operation is None:
+            pass
+        else:
             owners = session_operation.stages
-            if self.name not in owners or self.stream_targets:
+            if self.name in owners:
+                index = owners.index(self.name)
+            else:
+                await self.send_failure(
+                    request_id, "session route must use fixed, linear payload edges"
+                )
+                return
+            if index + 1 < len(owners):
+                expected = self.logical_source(owners[index + 1])
+            else:
+                expected = None
+            if any(target != expected for target in self.stream_targets):
                 await self.send_failure(
                     request_id, "session route must use fixed, linear payload edges"
                 )
                 return
             else:
                 pass
-            index = owners.index(self.name)
-            if index + 1 < len(owners):
-                expected = self.logical_source(owners[index + 1])
-            else:
-                expected = None
-            actual = self.get_next(request_id, result)
             if isinstance(actual, list) and len(actual) == 1:
                 actual_target = actual[0]
             else:
@@ -1639,6 +1752,13 @@ class Stage:
                 await self.send_failure(
                     request_id, "session route differs from the stage payload route"
                 )
+                return
+            else:
+                is_forwarded_at_admission = expected in self.stream_targets
+        if on_submitted is not None:
+            # Claim before any stream completion, so a refused result sends none.
+            next_stages = actual
+            if not self.result_owner.claim_result(result, terminal=next_stages is None):
                 return
             else:
                 pass
@@ -1666,10 +1786,14 @@ class Stage:
                 is_done=True,
             )
 
-        next_stages = (
-            self.get_next(request_id, result) if session_operation is None else actual
-        )
+        if is_forwarded_at_admission:
+            self.clear_request_state(request_id)
+            return
+        else:
+            pass
+        next_stages = actual
         routes_to_self = False
+        keeps_state = False
         if next_stages is None:
             # Terminal: notify coordinator
             _emit_event(
@@ -1678,24 +1802,31 @@ class Stage:
                 event_name="stage_complete",
                 metadata={"terminal": True},
             )
-            await self.control_plane.send_complete(
-                CompleteMessage(
-                    request_id=request_id,
-                    from_stage=self.name,
-                    success=True,
-                    result=result.data if isinstance(result, StagePayload) else result,
-                )
+            message = CompleteMessage(
+                request_id=request_id,
+                from_stage=self.name,
+                success=True,
+                result=result.data if isinstance(result, StagePayload) else result,
             )
+            if on_submitted is None:
+                await self.control_plane.send_complete(message)
+            else:
+                await self.control_plane.send_complete(
+                    message, on_submitted=on_submitted
+                )
+                on_submitted()
         else:
             if isinstance(next_stages, str):
                 next_stages = [next_stages]
             else:
                 pass
+            routed = result if isinstance(result, RoutedPayloads) else None
+            keeps_state = routed is not None and routed.keep_request_state
             routes_to_self = any(
                 self.resolve_target_instance(request_id, target) == self.name
                 for target in next_stages
             )
-            if routes_to_self:
+            if routes_to_self and not keeps_state:
                 # A local dispatch can register the next pass synchronously.
                 # Keep its replica assignment but retire the completed pass first.
                 self.clear_request_state(request_id, keep_replica_bindings=True)
@@ -1712,13 +1843,17 @@ class Stage:
                 await self.send_to_stage(
                     request_id,
                     target,
-                    result,
+                    result if routed is None else routed.payloads[target],
                     allow_local_object=is_single_target,
                     allow_projected_local_object=not is_single_target,
                     stream_targets_for_request=stream_targets_for_request,
                 )
+                if on_submitted is not None:
+                    on_submitted()
+                else:
+                    pass
 
-        if not routes_to_self:
+        if not routes_to_self and not keeps_state:
             self.clear_request_state(request_id)
         else:
             pass

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import sys
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -16,12 +17,15 @@ import torch
 
 from sglang_omni.client.client import Client
 from sglang_omni.models.fun_cosyvoice3 import stages
+from sglang_omni.models.fun_cosyvoice3.hift_cuda_graph import HiftDecodeCudaGraphRunner
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
+from sglang_omni.models.fun_cosyvoice3.solve_graph_capture import SolveGraphCapture
 from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
     CosyVoice3StreamState,
     FunCosyVoice3StreamingVocoderScheduler,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.cuda import CUDAOmniPlatform
 from sglang_omni.platforms.xpu import XPUOmniPlatform
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -105,8 +109,12 @@ class GraphRunnableFakeFlow(RunnableFakeFlow):
 
 
 class RecordingPackedDiT(PackedDiT):
-    def __init__(self) -> None:
-        self.is_ragged = True
+    def __init__(self, *, is_ragged: bool = True) -> None:
+        self.is_ragged = is_ragged
+
+    def build_modulations(self, time_span: torch.Tensor, dtype: torch.dtype) -> None:
+        self.block_modulations = ()
+        self.final_modulations = ()
 
     def compile(self, dtype: torch.dtype | None) -> bool:
         del dtype
@@ -821,6 +829,7 @@ def test_flow_admission_defers_request_after_long_singleton(monkeypatch) -> None
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         device="cpu",
         flow_batch_admission_frames=2000,
         enable_dit_torch_compile=False,
@@ -865,6 +874,7 @@ def test_admission_budget_below_the_first_tier_keeps_finals_eager(monkeypatch) -
         enable_flow_cuda_graph=False,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         flow_batch_admission_frames=3,
         enable_dit_torch_compile=False,
     )
@@ -908,6 +918,7 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         device="cpu",
         enable_dit_torch_compile=False,
         dtype="float16",
@@ -959,6 +970,7 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         device="cpu",
         max_batch_size=4,
         enable_dit_torch_compile=False,
@@ -973,14 +985,32 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
 FLOW_GRAPH_CAPTURE_SHAPES = ((2, 16),)
 
 
+def null_autocast(
+    device_type: str,
+    dtype: torch.dtype | None = None,
+    enabled: bool = True,
+) -> contextlib.AbstractContextManager[None]:
+    return contextlib.nullcontext()
+
+
 def prepare_vocoder_startup(
     monkeypatch: pytest.MonkeyPatch,
     startup_events: list[str],
     *,
     device_type: str,
     allow_native_compile: bool,
-) -> GraphRunnableFakeFlow:
-    fake_flow = GraphRunnableFakeFlow(startup_events)
+    packed_estimator: PackedDiT | None = None,
+) -> GraphRunnableFakeFlow | stages.FunCosyVoice3Flow:
+    loaded_flow: GraphRunnableFakeFlow | stages.FunCosyVoice3Flow = (
+        GraphRunnableFakeFlow(startup_events)
+    )
+    if packed_estimator is not None:
+        loaded_flow = stages.FunCosyVoice3Flow(
+            loaded_flow,
+            packed_estimator=packed_estimator,
+        )
+    else:
+        pass
     resolved_device = torch.device(device_type)
     monkeypatch.setattr(
         stages,
@@ -993,14 +1023,14 @@ def prepare_vocoder_startup(
         stages,
         "load_cosyvoice3_flow_hift",
         lambda checkpoint_dir, device, fp16, autocast_dtype, enable_flow_estimator_trt=False: (
-            fake_flow,
+            loaded_flow,
             FakeHiFT(),
         ),
     )
 
     def record_native_compile(flow, autocast_dtype: torch.dtype | None) -> None:
         if allow_native_compile:
-            assert flow is fake_flow
+            assert flow is loaded_flow
             assert autocast_dtype == torch.bfloat16
             startup_events.append("native_compile")
         else:
@@ -1023,7 +1053,7 @@ def prepare_vocoder_startup(
 
         class RecordingFlowCudaGraphRunner:
             def __init__(self, flow, *, device, autocast_dtype) -> None:
-                assert flow is fake_flow
+                assert flow is loaded_flow
                 assert device.type == device_type
                 assert autocast_dtype == torch.bfloat16
                 startup_events.append("runner_create")
@@ -1035,7 +1065,7 @@ def prepare_vocoder_startup(
         monkeypatch.setattr(stages, "FlowCudaGraphRunner", RecordingFlowCudaGraphRunner)
     else:
         pass
-    return fake_flow
+    return loaded_flow
 
 
 @pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
@@ -1056,6 +1086,7 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         device="cuda",
         enable_dit_torch_compile=enable_dit_torch_compile,
         enable_flow_cuda_graph=True,
@@ -1070,6 +1101,43 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
     else:
         assert "native_compile" not in startup_events
     assert ("packed_warmup" in startup_events) is enable_dit_torch_compile
+
+
+def test_create_vocoder_executor_skips_the_padded_dit_startup_on_the_packed_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    startup_events: list[str] = []
+    prepare_vocoder_startup(
+        monkeypatch,
+        startup_events,
+        device_type="cuda",
+        allow_native_compile=False,
+        packed_estimator=RecordingPackedDiT(is_ragged=True),
+    )
+    monkeypatch.setattr(
+        stages,
+        "set_dit_compile_config",
+        lambda: startup_events.append("compile_config"),
+    )
+    monkeypatch.setattr(torch, "autocast", null_autocast)
+
+    stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype="bfloat16",
+        flow_prefix_cache_gb=0.0,
+        enable_dit_torch_compile=True,
+        enable_flow_cuda_graph=True,
+        flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
+        enable_flow_prefix_cuda_graph=False,
+        enable_flow_whole_history_cuda_graph=False,
+        enable_hift_cuda_graph=False,
+    )
+
+    assert "runner_create" not in startup_events
+    assert startup_events.index("compile_config") < startup_events.index(
+        "packed_warmup"
+    )
 
 
 @pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
@@ -1090,6 +1158,7 @@ def test_create_vocoder_executor_on_xpu_captures_flow_graphs_only_for_an_eager_d
         flow_prefix_cache_gb=0.0,
         enable_flow_prefix_cuda_graph=True,
         enable_flow_whole_history_cuda_graph=True,
+        enable_hift_cuda_graph=False,
         device="xpu",
         enable_dit_torch_compile=enable_dit_torch_compile,
         enable_flow_cuda_graph=True,
@@ -1099,6 +1168,51 @@ def test_create_vocoder_executor_on_xpu_captures_flow_graphs_only_for_an_eager_d
     assert ("graph_capture" in startup_events) is not enable_dit_torch_compile
 
 
+@pytest.mark.parametrize(
+    ("is_ragged", "dtype", "enable_flow_estimator_trt", "is_buffered_packed"),
+    [
+        (True, "bfloat16", False, True),
+        (False, "bfloat16", False, False),
+        (True, "float32", False, False),
+        (True, "bfloat16", True, False),
+    ],
+)
+def test_create_vocoder_executor_packs_buffered_flow_only_on_ragged_attention(
+    monkeypatch: pytest.MonkeyPatch,
+    is_ragged: bool,
+    dtype: str,
+    enable_flow_estimator_trt: bool,
+    is_buffered_packed: bool,
+) -> None:
+    loaded_flow = prepare_vocoder_startup(
+        monkeypatch,
+        [],
+        device_type="cuda",
+        allow_native_compile=False,
+        packed_estimator=RecordingPackedDiT(is_ragged=is_ragged),
+    )
+    if enable_flow_estimator_trt:
+        loaded_flow.packed_estimator = None
+    else:
+        pass
+    monkeypatch.setattr(torch, "autocast", null_autocast)
+
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cuda",
+        dtype=dtype,
+        flow_prefix_cache_gb=0.0,
+        enable_flow_cuda_graph=False,
+        enable_flow_prefix_cuda_graph=False,
+        enable_flow_whole_history_cuda_graph=False,
+        enable_hift_cuda_graph=False,
+        enable_dit_torch_compile=False,
+        enable_flow_estimator_trt=enable_flow_estimator_trt,
+    )
+
+    assert scheduler.vocoder.flow.is_buffered_packed is is_buffered_packed
+
+
 def test_create_vocoder_executor_rejects_trt_and_compile() -> None:
     with pytest.raises(ValueError, match="enable only one"):
         stages.create_vocoder_executor(
@@ -1106,6 +1220,7 @@ def test_create_vocoder_executor_rejects_trt_and_compile() -> None:
             flow_prefix_cache_gb=0.0,
             enable_flow_prefix_cuda_graph=True,
             enable_flow_whole_history_cuda_graph=True,
+            enable_hift_cuda_graph=False,
             enable_dit_torch_compile=True,
             enable_flow_estimator_trt=True,
         )
@@ -1245,6 +1360,7 @@ def test_create_vocoder_executor_rejects_non_positive_admission_budget(
             flow_prefix_cache_gb=0.0,
             enable_flow_prefix_cuda_graph=True,
             enable_flow_whole_history_cuda_graph=True,
+            enable_hift_cuda_graph=False,
             device="cpu",
             flow_batch_admission_frames=0,
             enable_dit_torch_compile=False,
@@ -1416,6 +1532,161 @@ def test_hift_step_final_is_bit_identical_beside_finals_of_other_widths(
         alone = [vocoder.hift_step([row])[0] for row in rows]
     for (delta, emitted_after), (reference, reference_after) in zip(
         batched, alone, strict=True
+    ):
+        assert emitted_after == reference_after
+        assert torch.equal(delta, reference)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_vocoder_hift_snake_is_bit_identical_to_cosyvoice() -> None:
+    snake_class = pytest.importorskip("cosyvoice.transformer.activation").Snake
+    hift = make_causal_hift(10.0)
+    snakes = [module for module in hift.modules() if isinstance(module, snake_class)]
+    with torch.no_grad():
+        for snake in snakes:
+            snake.alpha.copy_(torch.linspace(0.125, 4.0, snake.in_features))
+    reference_hift = copy.deepcopy(hift)
+    stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    pairs = [
+        (module, reference)
+        for module, reference in zip(hift.modules(), reference_hift.modules())
+        if isinstance(reference, snake_class)
+    ]
+    assert pairs
+    torch.manual_seed(3)
+    with torch.inference_mode():
+        for module, reference in pairs:
+            x = torch.randn(3, reference.in_features, 2049, device="cuda") * 30
+            assert torch.equal(module(x), reference(x))
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_vocoder_leaves_hift_unpatched_off_nvidia(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    hift = make_causal_hift(10.0)
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    assert not vocoder.has_hift_kernels
+    assert all("forward" not in vars(module) for module in hift.modules())
+    assert "_stft" not in vars(hift) and "_istft" not in vars(hift)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    hift = make_causal_hift(10.0)
+    reference_hift = copy.deepcopy(hift)
+    stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    torch.manual_seed(2)
+    waveforms = torch.randn(3, 4800, device="cuda") * 0.3
+    magnitude = torch.rand(3, 9, 1201, device="cuda") * 2
+    phase = (torch.rand(3, 9, 1201, device="cuda") * 2 - 1) * torch.pi
+    with torch.inference_mode():
+        references = (
+            *reference_hift._stft(
+                waveforms
+            ),  # noqa: leading-underscore  # upstream name
+            reference_hift._istft(  # noqa: leading-underscore  # upstream name
+                magnitude, phase
+            ),
+        )
+        sync_debug_mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            outputs = (
+                *hift._stft(waveforms),  # noqa: leading-underscore  # upstream name
+                hift._istft(  # noqa: leading-underscore  # upstream name
+                    magnitude, phase
+                ),
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode(sync_debug_mode)
+    for output, reference in zip(outputs, references, strict=True):
+        torch.testing.assert_close(output, reference)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hift_decode_replay_equals_each_rows_own_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    hift = make_causal_hift(10.0)
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    samples_per_frame = vocoder.hift_samples_per_mel_frame
+    device = torch.device("cuda", torch.cuda.current_device())
+    backend = current_platform.get_device_graph_backend(device)
+    assert backend is not None
+    runner = HiftDecodeCudaGraphRunner(
+        hift,
+        graphs=SolveGraphCapture(backend, device=device, autocast_dtype=torch.bfloat16),
+        mel_channels=80,
+        samples_per_frame=samples_per_frame,
+        row_tiers=[1, 4],
+        frame_tiers=[64],
+    )
+    runner.capture()
+    torch.manual_seed(4)
+    mel = torch.randn(3, 80, 64, device="cuda") * 3
+    source = torch.randn(3, 1, 64 * samples_per_frame, device="cuda") * 0.1
+    with torch.inference_mode():
+        replayed = runner.run(mel, source).clone()
+        alone = [
+            hift.decode(x=mel[row : row + 1], s=source[row : row + 1], finalize=True)
+            for row in range(3)
+        ]
+    for row, reference in enumerate(alone):
+        assert torch.equal(replayed[row : row + 1], reference)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hift_step_through_the_decode_graphs_equals_the_eager_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), make_causal_hift(10.0))
+    samples_per_frame = vocoder.hift_samples_per_mel_frame
+    device = torch.device("cuda", torch.cuda.current_device())
+    backend = current_platform.get_device_graph_backend(device)
+    assert backend is not None
+    runner = HiftDecodeCudaGraphRunner(
+        vocoder.hift,
+        graphs=SolveGraphCapture(backend, device=device, autocast_dtype=torch.bfloat16),
+        mel_channels=80,
+        samples_per_frame=samples_per_frame,
+        row_tiers=[1, 4],
+        frame_tiers=[64, 128],
+    )
+    runner.capture()
+    torch.manual_seed(5)
+    rows = [
+        stages.HiftStepRow(
+            history=torch.randn(1, 80, total_frames, device="cuda") * 3,
+            emitted_samples=emitted_frames * samples_per_frame,
+            is_final=is_final,
+        )
+        for total_frames, emitted_frames, is_final in (
+            (50, 0, False),
+            (120, 60, False),
+            (100, 70, True),
+            (24, 0, True),
+        )
+    ]
+    with torch.inference_mode():
+        eager = vocoder.hift_step(rows)
+        vocoder.hift_decode_cuda_graph_runner = runner
+        replayed = vocoder.hift_step(rows)
+    for (delta, emitted_after), (reference, reference_after) in zip(
+        replayed, eager, strict=True
     ):
         assert emitted_after == reference_after
         assert torch.equal(delta, reference)

@@ -12,7 +12,7 @@ import time
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import count
-from typing import TYPE_CHECKING, Literal, Mapping, TypeVar, overload
+from typing import TYPE_CHECKING, Literal, Mapping, TypedDict, TypeVar, overload
 
 import numpy as np
 import torch
@@ -39,6 +39,7 @@ from sglang_omni.profiler.event_recorder import (
     get_recorder,
 )
 from sglang_omni.proto import StagePayload
+from sglang_omni.proto.admin import ADMIN_MODEL_INFO
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import (
@@ -49,7 +50,7 @@ from sglang_omni.scheduling.streaming_vocoder import (
 )
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 from sglang_omni.utils.cuda_staging import GrowablePinnedBuffer, PinnedTransferSlot
-from sglang_omni.utils.device import supports_device_streams
+from sglang_omni.utils.device import has_device_streams, supports_device_streams
 from sglang_omni.utils.snake_beta import fuse_vocoder_decoder
 
 if TYPE_CHECKING:
@@ -120,6 +121,21 @@ def decode_graph_frame_counts(
     for fresh in range(1, steady_stride + 1):
         counts.add(left_context + fresh)
     return tuple(sorted(counts))
+
+
+class VocoderModelInfo(TypedDict):
+    codec_state: CodecStateStats
+
+
+class UnsupportedAdminData(TypedDict):
+    skipped: bool
+    unsupported: bool
+
+
+class VocoderAdminResult(TypedDict):
+    success: bool
+    message: str
+    data: VocoderModelInfo | UnsupportedAdminData
 
 
 @dataclass
@@ -761,15 +777,20 @@ class Qwen3TTSStreamingVocoderScheduler(
         parameter = next(parameters(), None) if callable(parameters) else None
         codec_state_dtype = parameter.dtype if parameter is not None else torch.float32
         if (
-            supports_device_streams(self.device)
+            has_device_streams(self.device)
             and self.device.index is None
             and (parameter is not None)
-            and supports_device_streams(parameter.device)
+            and has_device_streams(parameter.device)
         ):
             self.device = parameter.device
         else:
             pass
         self.device_module = torch.get_device_module(self.device)
+        self.decode_stream_priority: int = (
+            vocoder_decode_stream_priority(self.device_module)
+            if supports_device_streams(self.device)
+            else 0
+        )
         if fused_snake_activation:
             replaced = fuse_vocoder_decoder(self.decoder)
             logger.info(f"Qwen3-TTS vocoder fused SnakeBeta modules: {replaced}")
@@ -907,7 +928,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             False
             if self.enable_stateful_codec_decoder and self.deterministic_inference
             else (
-                supports_device_streams(self.device)
+                has_device_streams(self.device)
                 if async_decode is None
                 else bool(async_decode)
             )
@@ -948,18 +969,17 @@ class Qwen3TTSStreamingVocoderScheduler(
         self.codec_slots_in_flight: set[int] = set()
         self.codec_slots_deferred: set[int] = set()
         self.decode_staging = threading.local()
-        self.pinned_staging_disabled = not supports_device_streams(self.device)
+        self.pinned_staging_disabled = not has_device_streams(self.device)
         self.cuda_decode_failed = False
-        if supports_device_streams(self.device):
-            followup_priority = vocoder_decode_stream_priority(self.device_module)
+        if has_device_streams(self.device):
             self.decode_stream = self.device_module.Stream(
-                device=self.device, priority=followup_priority
+                device=self.device, priority=self.decode_stream_priority
             )
             self.followup_decode_streams = (
                 tuple(
                     (
                         self.device_module.Stream(
-                            device=self.device, priority=followup_priority
+                            device=self.device, priority=self.decode_stream_priority
                         )
                         for _ in range(worker_count)
                     )
@@ -1064,17 +1084,14 @@ class Qwen3TTSStreamingVocoderScheduler(
         graph_enabled = bool(
             enabled and self.async_decode and (not self.deterministic_inference)
         )
-        graph_priority = (
-            vocoder_decode_stream_priority(self.device_module)
-            if supports_device_streams(self.device)
-            else 0
-        )
         graph_batch_sizes = self.resolve_incremental_warm_graph_batch_sizes(
             max_batch_size=min(self.followup_max_batch_size, codec_state_slots)
         )
         # note (ratish): the initial worker replays its cold, window and tail graphs one at a
         # time on its stream and copies each output out before the next, so they share a pool.
-        initial_graph_pool = IncrementalCodecGraphPool(stream_priority=graph_priority)
+        initial_graph_pool = IncrementalCodecGraphPool(
+            stream_priority=self.decode_stream_priority
+        )
         cold_widths = tuple(sorted({int(frames) for frames in cold_frames}))
         initial = Qwen3TTSIncrementalCodecCudaGraphRunner(
             self.incremental_decoder,
@@ -1161,7 +1178,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                     ),
                     arena=self.codec_arena,
                     graph_pool=IncrementalCodecGraphPool(
-                        stream_priority=graph_priority
+                        stream_priority=self.decode_stream_priority
                     ),
                 )
                 for _ in range(worker_count)
@@ -1219,6 +1236,71 @@ class Qwen3TTSStreamingVocoderScheduler(
                 pass
             self.codec_stats_last_log_s = now
         logger.info("Qwen3-TTS incremental Codec state: %s", self.codec_state_stats())
+
+    def log_cuda_graph_coverage(self, running_stream_count: int | None) -> None:
+        """Log the decode graphs startup captured; warn when the engine can run more streams than slots."""
+        codec_stats = self.codec_state_stats()
+        if not codec_stats["enabled"]:
+            logger.info(
+                "Qwen3-TTS vocoder: stateful Codec decoder off, so every stream "
+                "decodes on the left-context path"
+            )
+            return
+        else:
+            pass
+        graph_stats = codec_stats["cuda_graphs"]
+        runner_stats = {
+            "cold": graph_stats["cold"],
+            "window": graph_stats["window"],
+            "tail": graph_stats["tail"],
+            **{
+                f"warm{index}": stats for index, stats in enumerate(graph_stats["warm"])
+            },
+        }
+        # note (Haoling Pu): a runner that was never built reports only "enabled".
+        coverage = ", ".join(
+            (
+                f"{name} {len(stats['build']['captured_keys'])} captured"
+                if stats["enabled"]
+                else f"{name} off ({stats.get('disable_reason') or 'not built'})"
+            )
+            for name, stats in runner_stats.items()
+        )
+        logger.info(
+            f"Qwen3-TTS vocoder CUDA graphs: {coverage}; "
+            f"Codec slots {codec_stats['slots']}"
+        )
+        if (
+            running_stream_count is not None
+            and codec_stats["slots"] < running_stream_count
+        ):
+            logger.warning(
+                f"Qwen3-TTS vocoder has {codec_stats['slots']} Codec slots, fewer "
+                f"than the {running_stream_count} requests the engine can run at "
+                "once; streams past the slots decode eagerly on the left-context "
+                "path. Set --vocoder.factory.codec_state_slots to at least "
+                f"{running_stream_count}."
+            )
+        else:
+            pass
+
+    def admin(
+        self, action: str, payload: dict[str, object] | None = None
+    ) -> VocoderAdminResult:
+        """Report the Codec state for model_info; skip every other action."""
+        # note (Haoling Pu): payload is part of the stage admin contract.
+        if action == ADMIN_MODEL_INFO:
+            return {
+                "success": True,
+                "message": "ok",
+                "data": {"codec_state": self.codec_state_stats()},
+            }
+        else:
+            return {
+                "success": True,
+                "message": f"unsupported admin action: {action}",
+                "data": {"skipped": True, "unsupported": True},
+            }
 
     def start(self) -> None:
         try:
@@ -1464,7 +1546,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         state.code_chunks.append(codes)
         codes_ready = state.pending_codes_ready
         state.pending_codes_ready = None
-        if codes_ready is None and supports_device_streams(codes.device):
+        if codes_ready is None and has_device_streams(codes.device):
             codes_ready = torch.get_device_module(codes.device).Event()
             codes_ready.record()
         else:
@@ -1869,13 +1951,13 @@ class Qwen3TTSStreamingVocoderScheduler(
     ) -> Qwen3TTSDecodeHandle:
         """Launch one decode batch and return its handle.
 
-        Asynchronous CUDA path:
+        Asynchronous accelerator path:
             stage CPU input -> run decoder -> extract audio deltas
             -> copy deltas and the invalid-row mask into the thread's pinned slot
             -> record its event
 
         Return behavior:
-            asynchronous CUDA path -> return a pending handle that owns the slot
+            asynchronous accelerator path -> return a pending handle that owns the slot
             CPU or pageable CUDA fallback -> return a complete handle
             deterministic multi-plan mode -> resolve each plan before returning
 
@@ -3394,18 +3476,8 @@ class Qwen3TTSStreamingVocoderScheduler(
             return
         else:
             pass
-        self.outbox.put(
-            OutgoingMessage(
-                request_id=request_id,
-                type="result",
-                data=StagePayload(
-                    request_id=payload.request_id,
-                    request=payload.request,
-                    data=self.final_result_data(request_id, payload, state),
-                ),
-            )
-        )
-        self.record_completed_stream_request_id(request_id)
+        for message in self.terminal_messages(request_id, payload, state):
+            self.outbox.put(message)
         self.clear_request_state(request_id)
 
     def fallback_full_decode(
